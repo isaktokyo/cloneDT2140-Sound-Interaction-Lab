@@ -29,6 +29,12 @@ const CRASH_MIN_SPEED = 0.8; // slowest hit that still makes a (soft) wave sound
 const CRASH_FULL_SPEED = 4.5;// hit speed that gives the biggest crash
 const CRASH_GAP_MS = 220;    // shortest time between two crashes on the same side
 
+const FISH_COUNT = 4;        // fish in the tank
+const HARM_FROM = 0.3;       // crashes softer than this (0..1) don't hurt the fish
+const HARM = 0.65;           // damage from a full crash to a fish right by that wall (1 = instant death)
+const HEAL_PER_SEC = 0.04;   // how fast hurt fish recover while the water is calm
+const RESPAWN_CALM_SEC = 4;  // hold the phone calm this long and a new fish replaces a dead one
+
 //------------------------------------------------------------------------------------------
 // AUDIO SETUP
 //------------------------------------------------------------------------------------------
@@ -160,6 +166,90 @@ function waveCrash(intensity, side) {
     }
 }
 
+// Fish sounds
+// 3) Fish sounds. pan -1 (left) .. +1 (right), from where the fish is in the tank.
+
+// One tone with its own envelope and panner; returns the oscillator so pitch can be shaped.
+function fishTone(pan, type, start, dur, peak, attack) {
+    const ctx = audioContext;
+    const p = ctx.createStereoPanner();
+    p.pan.value = Math.max(-1, Math.min(1, pan));
+    p.connect(oceanOut);
+    const osc = ctx.createOscillator();
+    osc.type = type;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, start);
+    g.gain.exponentialRampToValueAtTime(peak, start + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    osc.connect(g);
+    g.connect(p);
+    osc.start(start);
+    osc.stop(start + dur + 0.05);
+    return osc;
+}
+
+// A quiet underwater "blub": a sine whose pitch shoots up as the bubble pops
+function fishBubble(pan, when) {
+    const t = when === undefined ? audioContext.currentTime : when;
+    const f0 = 250 + 120 * Math.random();
+    const rise = 0.04 + 0.025 * Math.random();
+    const osc = fishTone(pan, "sine", t, rise + 0.05, 0.08 + 0.07 * Math.random(), 0.005);
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(f0 * (3.5 + Math.random()), t + rise);
+}
+
+// A short cartoony "oof": pitch drops, with a little wobble, louder when hurt more
+function fishHurt(pan, amount) {
+    const t = audioContext.currentTime;
+    const a = Math.max(0, Math.min(1, amount));
+    const dur = 0.12 + 0.08 * a;
+    const osc = fishTone(pan, "triangle", t, dur, 0.2 + 0.25 * a, 0.01);
+    osc.frequency.setValueAtTime(850 + 150 * Math.random(), t);
+    osc.frequency.exponentialRampToValueAtTime(400, t + dur);
+    const lfo = audioContext.createOscillator();
+    lfo.frequency.value = 28;
+    const depth = audioContext.createGain();
+    depth.gain.value = 40;
+    lfo.connect(depth);
+    depth.connect(osc.frequency);
+    lfo.start(t);
+    lfo.stop(t + dur + 0.05);
+}
+
+// Sad cartoon "wah-wah-wahhh": three falling notes, the last one long, sliding down
+function fishDeath(pan) {
+    const t = audioContext.currentTime;
+    const notes = [[392, 0, 0.3], [370, 0.33, 0.3], [349, 0.66, 0.95]];   // G4, F#4, F4
+    for (const [freq, at, dur] of notes) {
+        const osc = fishTone(pan, "triangle", t + at, dur, 0.35, 0.03);
+        osc.frequency.setValueAtTime(freq, t + at);
+        if (dur > 0.5) {
+            osc.frequency.setValueAtTime(freq, t + at + 0.3);
+            osc.frequency.exponentialRampToValueAtTime(freq * 0.75, t + at + dur);
+            const lfo = audioContext.createOscillator();
+            lfo.frequency.value = 6;
+            const depth = audioContext.createGain();
+            depth.gain.value = 9;
+            lfo.connect(depth);
+            depth.connect(osc.frequency);
+            lfo.start(t + at);
+            lfo.stop(t + at + dur + 0.05);
+        }
+    }
+    // the last bubbles float up
+    fishBubble(pan, t + 1.65);
+    fishBubble(pan, t + 1.85);
+}
+
+// Cheerful rising plinks when a new fish swims in
+function fishArrive(pan) {
+    const t = audioContext.currentTime;
+    [784, 988, 1319].forEach((freq, i) => {                             // G5, B5, E6
+        const osc = fishTone(pan, "sine", t + i * 0.09, 0.18, 0.25, 0.005);
+        osc.frequency.value = freq;
+    });
+}
+
 //==========================================================================================
 // WATER PHYSICS
 //------------------------------------------------------------------------------------------
@@ -200,6 +290,7 @@ function stepWater() {
                     const intensity = Math.pow(Math.min((speed - CRASH_MIN_SPEED) / (CRASH_FULL_SPEED - CRASH_MIN_SPEED), 1), 1.3);
                     lastCrash[side] = now;
                     playAudio(intensity, side);
+                    hurtFish(intensity, side);
                 }
             }
         }
@@ -213,6 +304,8 @@ function stepWater() {
     bedGain.gain.setTargetAtTime(0.04 + 0.05 * swell + 0.55 * speed, at, 0.08);
     bedFilter.frequency.setTargetAtTime(300 + 250 * swell + 2600 * speed, at, 0.08);
     bedPan.pan.setTargetAtTime(Math.max(-1, Math.min(1, waterPos * 0.7)), at, 0.1);
+
+    stepFish(frame);
 }
 
 //==========================================================================================
@@ -244,6 +337,8 @@ p5.prototype.registerMethod("post", function () {
         p.endShape(p.CLOSE);
     }
 
+    drawFish(p, surface);
+
     // Foam spray from the latest crashes
     const ft = Math.min(p.deltaTime / 1000, 0.1);
     for (const f of foam) {
@@ -270,6 +365,145 @@ function sprayFoam(intensity, side) {
             r: 3 + 9 * Math.random(),
             life: 0.7 + 0.8 * Math.random(),
         });
+    }
+}
+
+//==========================================================================================
+// FISH
+//------------------------------------------------------------------------------------------
+// Fish swim in the tank and get carried by the water. A hard crash hurts every fish (most of
+// all the ones near that wall); enough hard crashes and a fish dies and floats belly-up.
+// Calm water lets hurt fish recover, and holding the phone calm for a few seconds brings a
+// new fish in to replace a dead one.
+//==========================================================================================
+const FISH_COLOURS = [[255, 140, 40], [255, 210, 60], [240, 90, 120], [120, 220, 160]];
+let fish = [];
+let calmFor = 0;
+let nextBubble = 1.5;
+
+function newFish(i) {
+    return {
+        x: Math.random() * 1.6 - 0.8,           // -1..1 across the tank
+        depth: 0.25 + 0.6 * Math.random(),       // 0 = surface, 1 = bottom
+        dir: Math.random() < 0.5 ? -1 : 1,
+        speed: 0.12 + 0.12 * Math.random(),
+        health: 1,
+        alive: true,
+        flinch: 0,                              // > 0 right after being hurt (shakes on screen)
+        colour: FISH_COLOURS[i % FISH_COLOURS.length],
+        phase: Math.random() * 6,
+    };
+}
+for (let i = 0; i < FISH_COUNT; i++) fish.push(newFish(i));
+
+function audioOn() {
+    return dspNode && audioContext.state !== 'suspended';
+}
+
+function hurtFish(intensity, side) {
+    if (intensity < HARM_FROM) return;
+    const force = (intensity - HARM_FROM) / (1 - HARM_FROM);
+    for (const f of fish) {
+        if (!f.alive) continue;
+        const nearWall = 1 - Math.abs(side - f.x) / 2;            // 1 at that wall, 0 at the other
+        f.health -= HARM * force * (0.35 + 0.65 * nearWall);
+        f.flinch = 0.4;
+        if (f.health <= 0) {
+            f.health = 0;
+            f.alive = false;
+            if (audioOn()) fishDeath(f.x);
+        } else if (audioOn()) {
+            fishHurt(f.x, force);
+        }
+    }
+    updateFishLabel();
+}
+
+function stepFish(dt) {
+    const calm = Math.abs(waterVel) < 0.4 && Math.abs(tiltDeg) < DEAD_ZONE * 2;
+    calmFor = calm ? calmFor + dt : 0;
+
+    for (const f of fish) {
+        f.flinch = Math.max(0, f.flinch - dt);
+        f.x += waterVel * 0.5 * dt;                                // the water carries every fish
+        if (f.alive) {
+            f.x += f.dir * f.speed * dt * (calm ? 1 : 0.4);
+            if (f.x > 0.85) f.dir = -1;
+            if (f.x < -0.85) f.dir = 1;
+            if (calm) f.health = Math.min(1, f.health + HEAL_PER_SEC * dt);
+        } else {
+            f.depth = Math.max(0, f.depth - 0.25 * dt);            // dead fish float up
+        }
+        f.x = Math.max(-0.92, Math.min(0.92, f.x));
+    }
+
+    // A new fish replaces a dead one after a calm spell
+    if (calmFor > RESPAWN_CALM_SEC) {
+        const dead = fish.findIndex((f) => !f.alive);
+        if (dead >= 0) {
+            fish[dead] = newFish(dead);
+            fish[dead].x = fish[dead].dir > 0 ? -0.92 : 0.92;     // swims in from the side
+            if (audioOn()) fishArrive(fish[dead].x);
+            updateFishLabel();
+        }
+        calmFor = 0;
+    }
+
+    updateFishLabel();
+
+    // Living fish blow the odd bubble
+    nextBubble -= dt;
+    const living = fish.filter((f) => f.alive);
+    if (nextBubble <= 0) {
+        nextBubble = 0.8 + Math.random() * 2.5;
+        if (living.length && audioOn()) {
+            fishBubble(living[Math.floor(Math.random() * living.length)].x);
+        }
+    }
+}
+
+let fishLabel = "";
+function updateFishLabel() {
+    if (!statusLabels[2]) return;
+    const alive = fish.filter((f) => f.alive).length;
+    const text = "fish " + alive + "/" + fish.length + " alive";
+    if (text !== fishLabel) {
+        fishLabel = text;
+        statusLabels[2].html(text);
+    }
+}
+
+function drawFish(p, surface) {
+    const w = p.width, h = p.height;
+    for (const f of fish) {
+        const px = (f.x + 1) / 2 * w;
+        const top = surface(px) + 18;
+        const py = top + f.depth * (h - 30 - top) + (f.alive ? Math.sin(p.millis() / 400 + f.phase) * 4 : 0);
+        const shake = f.flinch > 0 ? Math.sin(p.millis() / 20) * 4 : 0;
+        const size = Math.min(w, h) * 0.07;
+        const [r, g, b] = f.colour;
+        const fade = f.alive ? 0.35 + 0.65 * f.health : 0;          // hurt fish go pale
+        p.push();
+        p.translate(px + shake, py);
+        if (!f.alive) p.scale(1, -1);                              // belly-up
+        p.scale(f.dir, 1);
+        p.noStroke();
+        p.fill(f.alive ? p.lerpColor(p.color(200), p.color(r, g, b), fade) : p.color(170));
+        p.triangle(-size * 0.5, 0, -size * 0.95, -size * 0.35, -size * 0.95, size * 0.35);
+        p.ellipse(0, 0, size * 1.2, size * 0.7);
+        p.fill(255);
+        p.circle(size * 0.3, -size * 0.08, size * 0.22);
+        if (f.alive) {
+            p.fill(20);
+            p.circle(size * 0.33, -size * 0.08, size * 0.11);
+        } else {                                                   // X eyes
+            p.stroke(20);
+            p.strokeWeight(2);
+            const e = size * 0.07;
+            p.line(size * 0.3 - e, -size * 0.08 - e, size * 0.3 + e, -size * 0.08 + e);
+            p.line(size * 0.3 - e, -size * 0.08 + e, size * 0.3 + e, -size * 0.08 - e);
+        }
+        p.pop();
     }
 }
 
