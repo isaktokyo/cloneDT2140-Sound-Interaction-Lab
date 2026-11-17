@@ -71,7 +71,7 @@ function rotationChange(rotx, roty, rotz) {
         const t = Math.min((tilt - DEAD_ZONE) / (FULL_TILT - DEAD_ZONE), 1);
         pressure = MIN_PRESSURE + t * (1 - MIN_PRESSURE);
     }
-    if (statusLabels[1]) statusLabels[1].html("brass pressure: " + pressure.toFixed(2));
+    if (statusLabels[1]) statusLabels[1].html("pressure " + pressure.toFixed(2));
     playAudio(pressure);
 }
 

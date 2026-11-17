@@ -1,8 +1,8 @@
 //==========================================================================================
 // INTERACTION 4: MARACA
 //------------------------------------------------------------------------------------------
-// Shake the phone like a maraca. Every stroke of the shake rattles the "beads": a hard
-// flick gives a loud, dense rattle, a gentle one a soft, sparse one.
+// Shake the phone like a maraca. Every flick rattles the "beads": a hard flick gives a
+// loud, dense rattle, a gentle one a soft, sparse one.
 //
 // Self-contained: the sound is synthesised here with the Web Audio API, using a simplified
 // version of Perry Cook's PhISEM shaker model (many tiny random bead collisions, filtered
@@ -18,10 +18,11 @@ let jsonParams = null;
 //------------------------------------------------------------------------------------------
 // SETTINGS (tune these on the day)
 //------------------------------------------------------------------------------------------
-const HIT_THRESHOLD = 12;    // shake strength needed for a rattle (p5 acceleration units)
-const MAX_STRENGTH = 50;     // shake strength that gives the loudest rattle
-const MIN_GAP_MS = 60;       // shortest time between two rattles
-const GOURD_FREQ = 3200;     // resonance of the gourd in Hz (higher = smaller, brighter maraca)
+const HIT_THRESHOLD = 7;     // flick strength (m/s^2, gravity removed) that fires a rattle
+const MAX_STRENGTH = 30;     // flick strength that gives the loudest rattle
+const MIN_GAP_MS = 45;       // shortest time between two rattles (allows ~11 rattles a second)
+const GOURD_FREQ = 4200;     // resonance of the gourd in Hz (higher = smaller, brighter maraca)
+const RATTLE_MS = 70;        // length of one rattle (shorter = more staccato)
 
 //------------------------------------------------------------------------------------------
 // AUDIO SETUP
@@ -29,91 +30,100 @@ const GOURD_FREQ = 3200;     // resonance of the gourd in Hz (higher = smaller, 
 const maracaOut = audioContext.createGain();
 maracaOut.gain.value = 0.9;
 const maracaComp = audioContext.createDynamicsCompressor();
+maracaComp.attack.value = 0.001;   // fast, so it doesn't soften the clicky attack
 maracaOut.connect(maracaComp);
 maracaComp.connect(audioContext.destination);
 dspNode = maracaOut;
 
-// One rattle: beads collide many times, then settle as their energy dies away.
+// Shared filters (made once, not per rattle, to keep each trigger as cheap as possible)
+const maracaGourd = audioContext.createBiquadFilter();
+maracaGourd.type = "bandpass";
+maracaGourd.frequency.value = GOURD_FREQ;
+maracaGourd.Q.value = 2.2;
+const maracaHighpass = audioContext.createBiquadFilter();
+maracaHighpass.type = "highpass";
+maracaHighpass.frequency.value = 1800;
+maracaGourd.connect(maracaHighpass);
+maracaHighpass.connect(maracaOut);
+
+// One rattle: all the beads slam into the shell at once (a sharp, dense burst of tiny
+// clicks) and the collisions die away within a few tens of milliseconds.
 function maracaRattle(intensity, when) {
     const ctx = audioContext;
     const t = when === undefined ? ctx.currentTime : when;
     const sr = ctx.sampleRate;
-    const len = Math.floor(sr * 0.2);
+    const dur = (RATTLE_MS + 30 * intensity) / 1000;          // harder = slightly longer tail
+    const len = Math.floor(sr * dur);
     const buffer = ctx.createBuffer(1, len, sr);
     const data = buffer.getChannelData(0);
 
-    const energyDecay = Math.exp(-1 / (sr * (0.03 + 0.03 * intensity))); // bead energy dies away
-    const clickDecay = Math.exp(-1 / (sr * 0.0015));                     // each collision is a ~1.5 ms click
-    const collisionsPerSecond = 1500 + 7000 * intensity;                 // harder shake = more collisions
+    const energyDecay = Math.exp(-1 / (sr * dur * 0.22));      // beads lose energy fast
+    const clickDecay = Math.exp(-1 / (sr * 0.0006));           // each collision is a ~0.6 ms click
+    const collisionsPerSecond = 6000 + 14000 * intensity;      // harder flick = more collisions
     let energy = 1;
     let level = 0;
     for (let i = 0; i < len; i++) {
         energy *= energyDecay;
         if (Math.random() < (collisionsPerSecond / sr) * energy) {
-            level += energy * (0.4 + 0.6 * Math.random());
+            level += energy * (0.3 + 0.7 * Math.random());
         }
         level *= clickDecay;
-        data[i] = level * (Math.random() * 2 - 1);
+        // short fade at the very end so there's no click when the buffer stops
+        const fade = Math.min(1, (len - i) / (sr * 0.004));
+        data[i] = level * (Math.random() * 2 - 1) * fade;
     }
-    let peak = 0;                                   // normalise so loudness only depends on intensity
+    let peak = 0;                                              // normalise so loudness only depends on intensity
     for (let i = 0; i < len; i++) peak = Math.max(peak, Math.abs(data[i]));
     if (peak > 0) for (let i = 0; i < len; i++) data[i] /= peak;
 
     const src = ctx.createBufferSource();
     src.buffer = buffer;
-
-    // The gourd: a resonant band around GOURD_FREQ, varied a little so no two rattles are identical
-    const gourd = ctx.createBiquadFilter();
-    gourd.type = "bandpass";
-    gourd.frequency.value = GOURD_FREQ * (0.9 + 0.2 * Math.random());
-    gourd.Q.value = 1.8;
-
-    const highpass = ctx.createBiquadFilter();
-    highpass.type = "highpass";
-    highpass.frequency.value = 900;
-
+    src.playbackRate.value = 0.94 + 0.12 * Math.random();     // tiny variation, so no two rattles are identical
     const gain = ctx.createGain();
-    gain.gain.value = 1.4 * (0.25 + 0.75 * intensity);
-
-    src.connect(gourd);
-    gourd.connect(highpass);
-    highpass.connect(gain);
-    gain.connect(maracaOut);
+    gain.gain.value = 2.2 * (0.3 + 0.7 * intensity);
+    src.connect(gain);
+    gain.connect(maracaGourd);
     src.start(t);
 }
 
 //==========================================================================================
 // INTERACTIONS
 //------------------------------------------------------------------------------------------
-// A shake is a back-and-forth movement. Acceleration peaks at each end of a stroke (where
-// the beads slam into the shell) and drops near zero in the middle. So we watch the
-// acceleration strength, wait for each peak, and rattle once per peak, as loud as the peak.
+// For speed this reads the motion sensor directly (every sensor update, ~60 per second)
+// instead of waiting for p5's screen redraw. A rattle fires the moment a flick crosses
+// HIT_THRESHOLD, i.e. at the start of the flick, not after its peak. It then waits for the
+// flick to die down before the next one can fire, so each flick gives exactly one rattle.
 //==========================================================================================
-let rattleState = "idle";   // idle -> rising (tracking a peak) -> cooldown (wait for it to drop)
-let rattlePeak = 0;
+let maracaArmed = true;
+let flickPeak = 0;
 let lastRattle = 0;
 let rattleCount = 0;
+let prevStrength = 0;
+
+function onMaracaMotion(event) {
+    const a = event.acceleration;                 // acceleration without gravity, m/s^2
+    if (!a || a.x === null) return;
+    const strength = Math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    const now = performance.now();
+
+    if (maracaArmed && strength > HIT_THRESHOLD && now - lastRattle > MIN_GAP_MS) {
+        // Loudness from how hard the flick is: the current strength plus how fast it is rising.
+        const sharpness = strength + Math.max(0, strength - prevStrength);
+        playAudio(Math.min(sharpness / (MAX_STRENGTH * 1.5), 1));
+        lastRattle = now;
+        maracaArmed = false;
+        flickPeak = strength;
+    } else if (!maracaArmed) {
+        flickPeak = Math.max(flickPeak, strength);
+        // Re-arm once the flick has died down (relative to its own peak, so fast shakes work too)
+        if (strength < Math.max(HIT_THRESHOLD * 0.5, flickPeak * 0.4)) maracaArmed = true;
+    }
+    prevStrength = strength;
+}
+window.addEventListener("devicemotion", onMaracaMotion);
 
 function accelerationChange(accx, accy, accz) {
-    if (!dspNode || audioContext.state !== "running") return;
-    const strength = Math.sqrt(accx * accx + accy * accy + accz * accz);
-
-    if (rattleState === "idle" && strength > HIT_THRESHOLD) {
-        rattleState = "rising";
-        rattlePeak = strength;
-    } else if (rattleState === "rising") {
-        if (strength > rattlePeak) {
-            rattlePeak = strength;                    // still climbing
-        } else if (strength < rattlePeak * 0.8) {    // past the peak: this is the bead impact
-            if (millis() - lastRattle > MIN_GAP_MS) {
-                playAudio(Math.min(rattlePeak / MAX_STRENGTH, 1));
-                lastRattle = millis();
-            }
-            rattleState = "cooldown";
-        }
-    } else if (rattleState === "cooldown" && strength < Math.max(HIT_THRESHOLD * 0.5, rattlePeak * 0.35)) {
-        rattleState = "idle";                         // stroke over, ready for the next one
-    }
+    // Not used: the maraca listens to the sensor directly (onMaracaMotion) to react faster.
 }
 
 function rotationChange(rotx, roty, rotz) {
@@ -134,7 +144,7 @@ function deviceTurned() {
 }
 
 function deviceShaken() {
-    // Only flashes the label: the rattles come from accelerationChange above.
+    // Only flashes the label: the rattles come from onMaracaMotion above.
     shaketimer = millis();
     statusLabels[0].style("color", "pink");
 }
@@ -151,7 +161,7 @@ function playAudio(intensity) {
     }
     maracaRattle(intensity);
     rattleCount++;
-    if (statusLabels[0]) statusLabels[0].html("rattles: " + rattleCount + " (last " + intensity.toFixed(2) + ")");
+    if (statusLabels[0]) statusLabels[0].html("shaken " + rattleCount);
 }
 
 //==========================================================================================

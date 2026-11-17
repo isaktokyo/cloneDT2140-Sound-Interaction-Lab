@@ -236,8 +236,8 @@ function rotationChange(rotx, roty, rotz) {
     }
 
     if (statusLabels[1]) {
-        statusLabels[1].html("lift " + (now - lastLift < LIFT_WINDOW_MS ? "yes" : "no") +
-            " | pose " + (inPose ? "yes" : "no") + " | " + (choirArmed ? "ready" : "lower phone to re-arm"));
+        statusLabels[1].html(choirArmed ? ("lift " + (now - lastLift < LIFT_WINDOW_MS ? "&#10003;" : "&ndash;") +
+            " pose " + (inPose ? "&#10003;" : "&ndash;")) : "lower to reset");
     }
 }
 
